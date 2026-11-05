@@ -429,6 +429,7 @@ input.edit { width: 100%; }
 <div id="lightbox" class="lightbox" role="dialog" aria-label="Photo" hidden><img id="lbImg" alt="Attached photo"></div>
 <div id="alertBox" class="alertbox" role="status" aria-live="polite" hidden></div>
 
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <script>
 (function () {
   'use strict';
@@ -596,16 +597,21 @@ input.edit { width: 100%; }
   var assetsApi = null;
   var lastToday = view;
 
-  /* ---------- saving and sync ---------- */
+  /* ---------- saving and sync (Supabase Cloud + LocalStorage) ---------- */
+  var SUPABASE_URL = 'https://xiiesiglbygntvzatkoh.supabase.co';
+  var SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InhpaWVzaWdsYnlnbnR2emF0a29oIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTM4NzU3NDEsImV4cCI6MjEwOTQ1MTc0MX0.hectZvO9nqAtpL1oOxAlLE0rltXWoJxG0mvsUB5gEco';
+  var BOARD_ID = 'default';
+  var sbClient = null;
+
   var remote = { ref: null, writing: false, dirty: false, timer: 0, seen: false, pending: null };
   var syncMode = 'local';
   function setSync(mode) {
     syncMode = mode;
     var txt = {
       local: 'Saved in this browser',
-      saving: 'Saving…',
-      synced: 'Synced to your account',
-      error: 'Not synced yet, data is safe in this browser'
+      saving: 'Saving to Supabase…',
+      synced: 'Cloud synced (Supabase)',
+      error: 'Offline, saved in this browser'
     }[mode] || '';
     $('#sync').textContent = txt;
   }
@@ -671,26 +677,85 @@ input.edit { width: 100%; }
     setTimeout(function () { if (remote.pending && !isEditing()) adopt(remote.pending); }, 50);
   });
   async function connect() {
-    var res = await Promise.all([window.claude.use('db'), window.claude.use('user')]);
-    var db = res[0], user = res[1];
-    if (!db || !user) return;
-    var id = await user.id();
-    if (!id) return;
-    remote.ref = db.doc('data/users/' + id + '/papan');
-    remote.ref.onSnapshot(onRemote, function () { remote.ref = null; setSync('local'); });
-  }
-  async function connectAssets() {
     try {
-      var a = await window.claude.use('assets');
-      if (a) { assetsApi = a; renderTasks(); }
-    } catch (e) {}
+      if (!sbClient) {
+        if (window.supabase && typeof window.supabase.createClient === 'function') {
+          sbClient = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+        } else {
+          setSync('local');
+          return;
+        }
+      }
+
+      remote.ref = {
+        set: async function (data) {
+          if (!sbClient) throw new Error('Supabase client unavailable');
+          var res = await sbClient.from('boards').upsert({
+            id: BOARD_ID,
+            state: data.state,
+            updated_at: new Date().toISOString()
+          });
+          if (res.error) throw res.error;
+          return res;
+        }
+      };
+
+      setSync('saving');
+
+      // 1. Initial fetch from Supabase
+      var res = await sbClient
+        .from('boards')
+        .select('state')
+        .eq('id', BOARD_ID)
+        .maybeSingle();
+
+      if (res.error) throw res.error;
+
+      if (res.data && res.data.state) {
+        onRemote({
+          exists: true,
+          data: function () { return { state: res.data.state }; }
+        });
+      } else {
+        // Initial setup: push initial/local state to Supabase
+        onRemote({
+          exists: false,
+          data: function () { return null; }
+        });
+      }
+
+      // 2. Realtime channel subscription for instant multi-device sync
+      sbClient
+        .channel('boards-sync')
+        .on('postgres_changes', {
+          event: '*',
+          schema: 'public',
+          table: 'boards',
+          filter: 'id=eq.' + BOARD_ID
+        }, function (payload) {
+          if (payload && payload.new && payload.new.state) {
+            onRemote({
+              exists: true,
+              data: function () { return { state: payload.new.state }; }
+            });
+          }
+        })
+        .subscribe(function (status) {
+          if (status === 'SUBSCRIBED') {
+            if (syncMode !== 'saving') setSync('synced');
+          }
+        });
+    } catch (e) {
+      setSync('error');
+    }
   }
   function tryConnect(n) {
-    if (window.claude && typeof window.claude.use === 'function') {
+    if (window.supabase && typeof window.supabase.createClient === 'function') {
       connect().catch(function () { remote.ref = null; setSync('local'); });
-      connectAssets();
-    } else if (n < 10) {
-      setTimeout(function () { tryConnect(n + 1); }, 500);
+    } else if (n < 20) {
+      setTimeout(function () { tryConnect(n + 1); }, 250);
+    } else {
+      setSync('local');
     }
   }
 
